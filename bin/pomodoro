@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+# herdr-pomodoro: a pomodoro timer that shows in the herdr sidebar.
+#
+# The timer's truth is a wall-clock end timestamp in a state file. A small
+# ticker process runs only while the timer is running and reports the
+# countdown as the `$pomodoro` workspace metadata token on the first
+# workspace, so a `$pomodoro` row at the top of `ui.sidebar.spaces.rows`
+# renders above the spaces list.
+#
+# Kept compatible with macOS's /bin/bash 3.2.
+
+set -uo pipefail
+
+HERDR="${HERDR_BIN_PATH:-herdr}"
+ROOT="${HERDR_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+PLUGIN_ID="${HERDR_PLUGIN_ID:-nkampa.pomodoro}"
+SOURCE="herdr-pomodoro"
+TOKEN="pomodoro"
+
+# Outside a plugin invocation (e.g. a tab_bar_right command), fall back to
+# herdr's plugin directories so every entrypoint shares one state file.
+CONFIG_DIR="${HERDR_PLUGIN_CONFIG_DIR:-$("$HERDR" plugin config-dir "$PLUGIN_ID" 2>/dev/null)}"
+STATE_DIR="${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/$PLUGIN_ID}"
+STATE_FILE="$STATE_DIR/state"
+LOCK_DIR="$STATE_DIR/lock"
+mkdir -p "$STATE_DIR"
+
+# ---------------------------------------------------------------------------
+# Config
+
+WORK_MINUTES=25
+SHORT_BREAK_MINUTES=5
+LONG_BREAK_MINUTES=15
+LONG_BREAK_EVERY=4
+AUTO_START_BREAKS=1
+AUTO_START_WORK=0
+ICON_WORK="🍅"
+ICON_BREAK="☕"
+ICON_PAUSED="⏸"
+SHOW_IDLE=1
+NOTIFY=herdr # herdr | system | both | off
+[ -f "$CONFIG_DIR/config" ] && . "$CONFIG_DIR/config"
+
+# ---------------------------------------------------------------------------
+# State
+
+load_state() {
+  STATUS=idle   # idle | running | paused
+  PHASE=work    # work | short | long
+  END=0         # epoch seconds when a running phase ends
+  REMAINING=0   # seconds left in a paused phase
+  DONE=0        # completed work sessions since reset
+  TARGET=""     # workspace id carrying the token
+  TICKER=""     # pid of the ticker process
+  [ -f "$STATE_FILE" ] && . "$STATE_FILE"
+}
+
+save_state() {
+  local tmp="$STATE_FILE.$$"
+  cat >"$tmp" <<EOF
+STATUS=$STATUS
+PHASE=$PHASE
+END=$END
+REMAINING=$REMAINING
+DONE=$DONE
+TARGET=$TARGET
+TICKER=$TICKER
+EOF
+  mv "$tmp" "$STATE_FILE"
+}
+
+lock() {
+  local tries=0
+  until mkdir "$LOCK_DIR" 2>/dev/null; do
+    tries=$((tries + 1))
+    # A crashed holder leaves the lock behind; break it after ~5s.
+    if [ "$tries" -ge 50 ]; then
+      rmdir "$LOCK_DIR" 2>/dev/null
+      tries=0
+    fi
+    sleep 0.1
+  done
+}
+
+unlock() {
+  rmdir "$LOCK_DIR" 2>/dev/null
+}
+
+now() {
+  date +%s
+}
+
+# ---------------------------------------------------------------------------
+# Timer math and rendering
+
+duration() {
+  case "$1" in
+    work) echo $((WORK_MINUTES * 60)) ;;
+    short) echo $((SHORT_BREAK_MINUTES * 60)) ;;
+    long) echo $((LONG_BREAK_MINUTES * 60)) ;;
+  esac
+}
+
+remaining() {
+  case "$STATUS" in
+    running)
+      local left=$((END - $(now)))
+      [ "$left" -lt 0 ] && left=0
+      echo "$left"
+      ;;
+    paused) echo "$REMAINING" ;;
+    *) duration work ;;
+  esac
+}
+
+clock() {
+  printf '%02d:%02d' $(($1 / 60)) $(($1 % 60))
+}
+
+# Position of the current pomodoro in the long-break cycle, e.g. 2 of 4.
+cycle_position() {
+  local pos=$((DONE % LONG_BREAK_EVERY))
+  if [ "$PHASE" = work ]; then
+    echo $((pos + 1))
+  elif [ "$pos" -eq 0 ]; then
+    echo "$LONG_BREAK_EVERY"
+  else
+    echo "$pos"
+  fi
+}
+
+phase_icon() {
+  if [ "$PHASE" = work ]; then echo "$ICON_WORK"; else echo "$ICON_BREAK"; fi
+}
+
+phase_name() {
+  case "$PHASE" in
+    work) echo "Focus" ;;
+    short) echo "Short break" ;;
+    long) echo "Long break" ;;
+  esac
+}
+
+status_line() {
+  local left
+  left="$(remaining)"
+  case "$STATUS" in
+    idle)
+      [ "$SHOW_IDLE" = 1 ] && echo "$ICON_WORK --:--"
+      ;;
+    running)
+      echo "$(phase_icon) $(clock "$left") $(cycle_position)/$LONG_BREAK_EVERY"
+      ;;
+    paused)
+      echo "$ICON_PAUSED $(phase_icon) $(clock "$left") $(cycle_position)/$LONG_BREAK_EVERY"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# herdr integration
+
+first_workspace() {
+  "$HERDR" workspace list 2>/dev/null |
+    grep -o '"workspace_id":"[^"]*"' | head -n 1 | cut -d'"' -f4
+}
+
+clear_token() {
+  [ -n "$1" ] || return 0
+  "$HERDR" workspace report-metadata "$1" --source "$SOURCE" \
+    --clear-token "$TOKEN" >/dev/null 2>&1
+}
+
+# Point TARGET at the first workspace, moving the token if it changed.
+retarget() {
+  local first
+  first="$(first_workspace)"
+  if [ -n "$first" ] && [ "$first" != "$TARGET" ]; then
+    clear_token "$TARGET"
+    TARGET="$first"
+  fi
+}
+
+report() {
+  local text
+  text="$(status_line)"
+  [ -n "$TARGET" ] || retarget
+  [ -n "$TARGET" ] || return 0
+  if [ -z "$text" ]; then
+    clear_token "$TARGET"
+    return 0
+  fi
+  # While running, expire the value so a dead ticker can't leave a frozen clock.
+  local ttl=""
+  [ "$STATUS" = running ] && ttl="--ttl-ms 5000"
+  "$HERDR" workspace report-metadata "$TARGET" --source "$SOURCE" \
+    --token "$TOKEN=$text" $ttl >/dev/null 2>&1
+}
+
+notify() {
+  local title="$1" body="$2"
+  case "$NOTIFY" in
+    herdr | both)
+      "$HERDR" notification show "$title" --body "$body" --sound "done" >/dev/null 2>&1
+      ;;
+  esac
+  case "$NOTIFY" in
+    system | both)
+      if command -v osascript >/dev/null 2>&1; then
+        osascript -e "display notification \"$body\" with title \"$title\" sound name \"Glass\"" >/dev/null 2>&1
+      elif command -v notify-send >/dev/null 2>&1; then
+        notify-send "$title" "$body" >/dev/null 2>&1
+      fi
+      ;;
+  esac
+}
+
+ticker_alive() {
+  [ -n "$TICKER" ] && kill -0 "$TICKER" 2>/dev/null
+}
+
+stop_ticker() {
+  ticker_alive && kill "$TICKER" 2>/dev/null
+  TICKER=""
+}
+
+start_ticker() {
+  stop_ticker
+  nohup bash "$ROOT/bin/pomodoro" tick >/dev/null 2>&1 &
+  TICKER=$!
+  disown "$TICKER" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Phase transitions (callers hold the lock and have loaded state)
+
+run_phase() {
+  PHASE="$1"
+  STATUS=running
+  END=$(($(now) + $(duration "$PHASE")))
+  start_ticker
+}
+
+hold_phase() {
+  PHASE="$1"
+  STATUS=paused
+  REMAINING="$(duration "$PHASE")"
+  stop_ticker
+}
+
+# Move to the phase after the current one. $1=1 when the phase ran out.
+advance() {
+  local finished="$1" next auto
+  if [ "$PHASE" = work ]; then
+    DONE=$((DONE + 1))
+    if [ $((DONE % LONG_BREAK_EVERY)) -eq 0 ]; then next=long; else next=short; fi
+    auto="$AUTO_START_BREAKS"
+    [ "$finished" = 1 ] && notify "$ICON_WORK Pomodoro done" \
+      "Take a $(($(duration "$next") / 60)) minute break."
+  else
+    next=work
+    auto="$AUTO_START_WORK"
+    [ "$finished" = 1 ] && notify "$ICON_BREAK Break over" "Back to focus."
+  fi
+  if [ "$auto" = 1 ] || { [ "$finished" = 0 ] && [ "$STATUS" = running ]; }; then
+    run_phase "$next"
+  else
+    hold_phase "$next"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+
+cmd_start() {
+  lock
+  load_state
+  case "$STATUS" in
+    idle) run_phase work ;;
+    paused)
+      STATUS=running
+      END=$(($(now) + REMAINING))
+      start_ticker
+      ;;
+    running) ticker_alive || start_ticker ;;
+  esac
+  save_state
+  unlock
+  report
+}
+
+cmd_stop() {
+  lock
+  load_state
+  if [ "$STATUS" = running ]; then
+    REMAINING="$(remaining)"
+    STATUS=paused
+    stop_ticker
+    save_state
+  fi
+  unlock
+  report
+}
+
+cmd_toggle() {
+  load_state
+  if [ "$STATUS" = running ]; then cmd_stop; else cmd_start; fi
+}
+
+cmd_reset() {
+  lock
+  load_state
+  stop_ticker
+  STATUS=idle
+  PHASE=work
+  END=0
+  REMAINING=0
+  DONE=0
+  save_state
+  unlock
+  report
+}
+
+cmd_skip() {
+  lock
+  load_state
+  advance 0
+  save_state
+  unlock
+  report
+}
+
+# Re-sync after herdr starts or the workspace list changes.
+cmd_refresh() {
+  lock
+  load_state
+  retarget
+  if [ "$STATUS" = running ] && ! ticker_alive; then
+    start_ticker
+  fi
+  save_state
+  unlock
+  report
+}
+
+cmd_tick() {
+  # The spawner holds the lock until it has saved our pid.
+  lock
+  unlock
+  while :; do
+    load_state
+    [ "$STATUS" = running ] && [ "$TICKER" = "$$" ] || exit 0
+    if [ "$(remaining)" -le 0 ]; then
+      lock
+      load_state
+      if [ "$STATUS" = running ] && [ "$TICKER" = "$$" ] && [ "$(remaining)" -le 0 ]; then
+        # advance may hand off to a new ticker; don't kill ourselves first.
+        TICKER=""
+        advance 1
+        save_state
+      fi
+      unlock
+      report
+      continue
+    fi
+    report
+    sleep 1
+  done
+}
+
+cmd_status() {
+  load_state
+  status_line
+}
+
+cmd_open_monitor() {
+  "$HERDR" plugin pane open --plugin "$PLUGIN_ID" --entrypoint monitor --focus >/dev/null
+}
+
+progress_bar() {
+  local width="$1" total left filled bar="" i
+  total="$(duration "$PHASE")"
+  left="$(remaining)"
+  filled=$(((total - left) * width / (total > 0 ? total : 1)))
+  for ((i = 0; i < width; i++)); do
+    if [ "$i" -lt "$filled" ]; then bar="$bar█"; else bar="$bar░"; fi
+  done
+  echo "$bar"
+}
+
+cycle_marks() {
+  local pos marks="" i
+  pos=$((DONE % LONG_BREAK_EVERY))
+  for ((i = 0; i < LONG_BREAK_EVERY; i++)); do
+    if [ "$i" -lt "$pos" ]; then marks="$marks$ICON_WORK "; else marks="$marks· "; fi
+  done
+  echo "$marks"
+}
+
+draw_monitor() {
+  local state
+  case "$STATUS" in
+    idle) state="ready" ;;
+    running) state="running" ;;
+    paused) state="paused" ;;
+  esac
+  printf '\033[H\033[2J'
+  printf '\n  %s  %s  (%s)\n\n' "$(phase_icon)" "$(phase_name)" "$state"
+  printf '  \033[1m%s\033[0m\n\n' "$(clock "$(remaining)")"
+  printf '  %s\n\n' "$(progress_bar 30)"
+  printf '  %s  %d done\n\n' "$(cycle_marks)" "$DONE"
+  printf '  \033[2mspace start/stop · r reset · n skip · q close\033[0m\n'
+}
+
+cmd_monitor() {
+  printf '\033[?25l'
+  trap 'printf "\033[?25h"' EXIT
+  local key
+  while :; do
+    load_state
+    draw_monitor
+    key=""
+    read -rsn1 -t 1 key
+    case "$key" in
+      " " | s) cmd_toggle ;;
+      r) cmd_reset ;;
+      n) cmd_skip ;;
+      q | $'\e') exit 0 ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<EOF
+usage: pomodoro <command>
+
+  start     start or resume the timer
+  stop      pause the timer
+  toggle    start or pause
+  reset     stop and clear the session
+  skip      jump to the next phase
+  status    print the current status line
+  monitor   interactive monitor (runs in the popup pane)
+  refresh   re-report the sidebar token
+EOF
+}
+
+case "${1:-}" in
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  toggle) cmd_toggle ;;
+  reset) cmd_reset ;;
+  skip) cmd_skip ;;
+  status) cmd_status ;;
+  monitor) cmd_monitor ;;
+  open-monitor) cmd_open_monitor ;;
+  refresh) cmd_refresh ;;
+  tick) cmd_tick ;;
+  *) usage; exit 1 ;;
+esac

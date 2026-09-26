@@ -1,0 +1,72 @@
+id = "nkampa.pomodoro"
+name = "Pomodoro"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Pomodoro timer with a 🍅 in the herdr sidebar: start, stop, reset, skip, and a live monitor popup."
+platforms = ["linux", "macos"]
+
+# Re-report the sidebar token and revive the ticker after herdr (re)starts.
+[[startup]]
+command = ["bash", "bin/pomodoro", "refresh"]
+
+[[actions]]
+id = "toggle"
+title = "Pomodoro: start / stop"
+contexts = ["global"]
+command = ["bash", "bin/pomodoro", "toggle"]
+
+[[actions]]
+id = "start"
+title = "Pomodoro: start / resume"
+contexts = ["global"]
+command = ["bash", "bin/pomodoro", "start"]
+
+[[actions]]
+id = "stop"
+title = "Pomodoro: stop (pause)"
+contexts = ["global"]
+command = ["bash", "bin/pomodoro", "stop"]
+
+[[actions]]
+id = "reset"
+title = "Pomodoro: reset"
+contexts = ["global"]
+command = ["bash", "bin/pomodoro", "reset"]
+
+[[actions]]
+id = "skip"
+title = "Pomodoro: skip to next phase"
+contexts = ["global"]
+command = ["bash", "bin/pomodoro", "skip"]
+
+[[actions]]
+id = "monitor"
+title = "Pomodoro: monitor"
+contexts = ["global"]
+command = ["bash", "bin/pomodoro", "open-monitor"]
+
+[[panes]]
+id = "monitor"
+title = "Pomodoro"
+placement = "popup"
+width = 52
+height = 14
+# Panes don't start in the plugin root, so resolve the script explicitly.
+command = ["sh", "-c", "exec bash \"$HERDR_PLUGIN_ROOT/bin/pomodoro\" monitor"]
+
+# The token lives on the first workspace; follow it when the list changes.
+[[events]]
+on = "workspace.created"
+command = ["bash", "bin/pomodoro", "refresh"]
+
+[[events]]
+on = "workspace.closed"
+command = ["bash", "bin/pomodoro", "refresh"]
+
+[[events]]
+on = "workspace.moved"
+command = ["bash", "bin/pomodoro", "refresh"]
+
+[[events]]
+on = "workspace.reordered"
+command = ["bash", "bin/pomodoro", "refresh"]
