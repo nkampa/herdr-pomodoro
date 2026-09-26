@@ -10,7 +10,8 @@ a 🍅 like [tmux-pomodoro-plus](https://github.com/olimorris/tmux-pomodoro-plus
 🍅 --:--            idle
 ```
 
-Plain bash, no build step, no dependencies beyond herdr itself.
+Plain bash, no build step. The timer needs only herdr; the work log needs
+`jq`, and the log browser needs `fzf`.
 
 ## How it works
 
@@ -65,6 +66,7 @@ The last two rows are herdr's defaults; keep whatever you had.
 | `nkampa.pomodoro.monitor` | popup with a progress bar and cycle count |
 | `nkampa.pomodoro.scope-toggle` | switch between one global timer and one per space |
 | `nkampa.pomodoro.refresh` | re-read config and re-sync the sidebar |
+| `nkampa.pomodoro.log` | browse the work log (fuzzy search by year / month / day) |
 
 In the monitor: `space` start/stop, `r` reset, `n` skip, `q` close.
 
@@ -77,6 +79,49 @@ type = "plugin_action"
 command = "nkampa.pomodoro.toggle"
 description = "pomodoro start/stop"
 ```
+
+## Work log
+
+Every focus period that ends (completed, skipped, or reset after at least
+`MIN_LOG_MINUTES`) is logged with:
+
+- start and end time, minutes focused, and how it ended
+- the space: name, folder, and git branch
+- the space's agents and their terminal titles (Claude titles its terminal
+  with a summary of the session, so this doubles as a "what was I doing")
+- an optional note
+
+When a pomodoro completes, a popup shows that context and asks what you got
+done. Enter saves the note; leaving it empty keeps the agent titles as the
+summary. The break keeps running meanwhile (`NOTE_PROMPT=required` holds the
+break until you answer, `off` skips the popup).
+
+Entries go to `~/.local/share/herdr-pomodoro/log.jsonl`, one JSON object per
+line, and (with `LOG_JOURNAL=1`) to a markdown file per day in
+`~/.local/share/herdr-pomodoro/journal/`:
+
+```markdown
+- 11:49–12:14 🍅 25m **chesscom** (`main`) — cache-first service worker
+```
+
+### Browsing the log
+
+The `log` action opens a popup to browse it (needs `fzf`):
+
+```
+all › sw
+  2026-09-25 Fri 11:49–12:14  🍅 25m  chesscom (feat/sw)  cache-first service worker
+  2026-08-03 Mon 09:00–09:25  🍅 25m  chesscom (feat/sw)  Service worker cache
+```
+
+Type to fuzzy-search every entry (space, branch, note, agent titles, dates).
+`ctrl-y` / `ctrl-o` / `ctrl-d` / `ctrl-e` switch to years, months, days, or
+all entries; `enter` drills into the selected year, month, or day; backspace
+on an empty query goes back up. The preview shows totals for a period
+(pomodoros, time, days, per-space breakdown) or the full entry.
+
+`bin/pomodoro log` prints today's entries (`log all`, `log 2026-09-25`).
+Logging needs `jq`.
 
 ## Tab bar (optional)
 
@@ -108,6 +153,15 @@ ICON_BREAK="☕"
 ICON_PAUSED="⏸"
 SHOW_IDLE=            # 1 shows "🍅 --:--" when idle; default 1 global, 0 space
 NOTIFY=herdr          # herdr | system | both | off
+
+# Work log
+LOG=1                 # 0 turns logging off
+LOG_FILE="$HOME/.local/share/herdr-pomodoro/log.jsonl"
+LOG_JOURNAL=1         # also write a markdown file per day
+JOURNAL_DIR="$HOME/.local/share/herdr-pomodoro/journal"
+NOTE_PROMPT=optional  # optional | required | off
+NOTE_TIMEOUT=300      # seconds before the note popup gives up
+MIN_LOG_MINUTES=1
 ```
 
 After editing, run the `nkampa.pomodoro.refresh` action. `scope-toggle` flips

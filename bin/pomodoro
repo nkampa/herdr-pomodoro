@@ -40,6 +40,16 @@ ICON_PAUSED="⏸"
 SCOPE=global # global | space
 SHOW_IDLE=""  # 1 or 0; defaults to 1 for global, 0 for space
 NOTIFY=herdr  # herdr | system | both | off
+
+# Work log: one entry per focus period (needs jq; the browser needs fzf).
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/herdr-pomodoro"
+LOG=1                           # 0 turns the work log off entirely
+LOG_FILE="$DATA_DIR/log.jsonl"  # the log itself, one JSON object per line
+LOG_JOURNAL=1                   # also append to a markdown file per day
+JOURNAL_DIR="$DATA_DIR/journal"
+NOTE_PROMPT=optional            # optional | required | off
+NOTE_TIMEOUT=300                # seconds before the note popup gives up
+MIN_LOG_MINUTES=1               # don't log focus periods shorter than this
 [ -f "$CONFIG_DIR/config" ] && . "$CONFIG_DIR/config"
 if [ -z "$SHOW_IDLE" ]; then
   if [ "$SCOPE" = space ]; then SHOW_IDLE=0; else SHOW_IDLE=1; fi
@@ -189,9 +199,16 @@ first_workspace() {
 }
 
 focused_workspace() {
-  "$HERDR" workspace list 2>/dev/null |
-    grep -o '{[^{}]*"focused":true[^{}]*}' |
-    grep -o '"workspace_id":"[^"]*"' | head -n 1 | cut -d'"' -f4
+  local list
+  list="$("$HERDR" workspace list 2>/dev/null)"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r 'first(.result.workspaces[]? | select(.focused) | .workspace_id) // empty' <<<"$list"
+  else
+    # Workspaces carry a nested "tokens" object, so drop it before matching.
+    printf '%s' "$list" | sed 's/"tokens":{[^}]*}//g' |
+      grep -o '{[^{}]*"focused":true[^{}]*}' |
+      grep -o '"workspace_id":"[^"]*"' | head -n 1 | cut -d'"' -f4
+  fi
 }
 
 workspace_label() {
@@ -270,6 +287,113 @@ start_ticker() {
 }
 
 # ---------------------------------------------------------------------------
+# Work log
+#
+# When a focus period ends, its context (space, folder, branch, agent titles)
+# is captured into a pending JSON file. The note popup, or record_pomodoro
+# itself when there's no popup, flushes it to the log with an optional note.
+
+fmt_time() {
+  date -r "$1" "+$2" 2>/dev/null || date -d "@$1" "+$2"
+}
+
+# Print the context of workspace $1 as a JSON object.
+capture_context() {
+  local ws="$1" start="$2" end="$3" focused="$4" outcome="$5"
+  local panes label cwd branch=""
+  panes="$("$HERDR" pane list 2>/dev/null)"
+  label="$(workspace_label "$ws")"
+  # Prefer an agent's folder; fall back to any pane in the space.
+  cwd="$(printf '%s' "$panes" | jq -r --arg ws "$ws" '
+    [.result.panes[]? | select(.workspace_id == $ws)]
+    | (map(select(.agent)) + .)[0] | .foreground_cwd // .cwd // empty' 2>/dev/null)"
+  [ -n "$cwd" ] && branch="$(git -C "$cwd" branch --show-current 2>/dev/null)"
+  printf '%s' "$panes" | jq -c \
+    --arg ws "$ws" --arg label "$label" --arg cwd "$cwd" --arg branch "$branch" \
+    --arg start "$(fmt_time "$start" %Y-%m-%dT%H:%M:%S%z)" \
+    --arg end "$(fmt_time "$end" %Y-%m-%dT%H:%M:%S%z)" \
+    --argjson start_epoch "$start" --argjson end_epoch "$end" \
+    --argjson minutes "$(((focused + 30) / 60))" --arg outcome "$outcome" '
+    {
+      start: $start, end: $end, start_epoch: $start_epoch, end_epoch: $end_epoch,
+      minutes: $minutes, outcome: $outcome,
+      space: {id: $ws, label: $label, cwd: $cwd, branch: $branch},
+      agents: [.result.panes[]? | select(.workspace_id == $ws and .agent)
+               | {agent, title: .terminal_title_stripped}]
+    }'
+}
+
+# One-line summary: the note, else the agent titles.
+entry_summary() {
+  jq -r 'if (.note // "") != "" then .note
+         else ([.agents[].title | select(. != null and . != "")] | unique | join(" · "))
+         end' <<<"$1"
+}
+
+write_journal() {
+  local entry="$1" day file line
+  day="$(jq -r '.start[0:10]' <<<"$entry")"
+  file="$JOURNAL_DIR/$day.md"
+  mkdir -p "$JOURNAL_DIR"
+  [ -f "$file" ] || printf '# Pomodoros %s\n\n' "$day" >"$file"
+  line="$(jq -r --arg icon "$ICON_WORK" --arg summary "$(entry_summary "$entry")" '
+    "- \(.start[11:16])–\(.end[11:16]) \($icon) \(.minutes)m **\(.space.label)**"
+    + (if .space.branch != "" then " (`\(.space.branch)`)" else "" end)
+    + (if $summary != "" then " — \($summary)" else "" end)
+    + (if .outcome != "completed" then " _(\(.outcome))_" else "" end)' <<<"$entry")"
+  printf '%s\n' "$line" >>"$file"
+}
+
+# Write pending entry $1 with note $2 to the log (and journal).
+flush_entry() {
+  local file="$1" note="${2:-}" entry
+  [ -f "$file" ] || return 0
+  entry="$(jq -c --arg note "$note" '. + {note: $note}' "$file" 2>/dev/null)" || entry=""
+  rm -f "$file"
+  [ -n "$entry" ] || return 0
+  mkdir -p "$(dirname "$LOG_FILE")"
+  printf '%s\n' "$entry" >>"$LOG_FILE"
+  [ "$LOG_JOURNAL" = 1 ] && write_journal "$entry"
+  return 0
+}
+
+# Flush entries whose note popup never answered (closed, or no client).
+sweep_pending() {
+  local file age
+  for file in "$STATE_DIR"/pending.*.json; do
+    [ -f "$file" ] || continue
+    age=$(($(now) - $(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file")))
+    [ "$age" -gt $((NOTE_TIMEOUT + 30)) ] && flush_entry "$file" ""
+  done
+}
+
+# Log the current focus period. $1 = completed | skipped | reset.
+# Sets NOTE_OPENED=1 when a note popup took over flushing.
+record_pomodoro() {
+  local outcome="$1" focused end ws pending
+  NOTE_OPENED=0
+  [ "$LOG" = 1 ] && command -v jq >/dev/null 2>&1 || return 0
+  [ "$PHASE" = work ] && [ "$STATUS" != idle ] || return 0
+  focused=$(($(duration work) - $(remaining)))
+  [ "$focused" -ge $((MIN_LOG_MINUTES * 60)) ] || return 0
+  end="$(now)"
+  ws="${WS:-$(focused_workspace)}"
+  pending="$STATE_DIR/pending.$end.$$.json"
+  capture_context "$ws" $((end - focused)) "$end" "$focused" "$outcome" >"$pending" || {
+    rm -f "$pending"
+    return 0
+  }
+  sweep_pending
+  if [ "$outcome" = completed ] && [ "$NOTE_PROMPT" != off ] &&
+    "$HERDR" plugin pane open --plugin "$PLUGIN_ID" --entrypoint note --focus \
+      --env "POMODORO_PENDING=$pending" --env "POMODORO_WORKSPACE=$WS" >/dev/null 2>&1; then
+    NOTE_OPENED=1
+    return 0
+  fi
+  flush_entry "$pending" ""
+}
+
+# ---------------------------------------------------------------------------
 # Phase transitions (callers hold the lock and have loaded state)
 
 run_phase() {
@@ -290,9 +414,12 @@ hold_phase() {
 advance() {
   local finished="$1" next auto
   if [ "$PHASE" = work ]; then
+    if [ "$finished" = 1 ]; then record_pomodoro completed; else record_pomodoro skipped; fi
     DONE=$((DONE + 1))
     if [ $((DONE % LONG_BREAK_EVERY)) -eq 0 ]; then next=long; else next=short; fi
     auto="$AUTO_START_BREAKS"
+    # In required mode the note popup starts the break once it's answered.
+    [ "$NOTE_PROMPT" = required ] && [ "$NOTE_OPENED" = 1 ] && auto=0
     [ "$finished" = 1 ] && notify "$ICON_WORK Pomodoro done" \
       "Take a $(($(duration "$next") / 60)) minute break."
   else
@@ -348,6 +475,7 @@ cmd_toggle() {
 cmd_reset() {
   lock
   load_state
+  record_pomodoro reset
   stop_ticker
   STATUS=idle
   PHASE=work
@@ -384,6 +512,7 @@ refresh_one() {
 # Re-sync after herdr starts, the workspace list changes, or SCOPE changes.
 cmd_refresh() {
   local ids id file
+  command -v jq >/dev/null 2>&1 && sweep_pending
   ids="$(workspace_ids)"
   # Start from a clean slate so switching SCOPE leaves no stale tokens.
   for id in $ids; do clear_token "$id"; done
@@ -540,6 +669,165 @@ cmd_monitor() {
   done
 }
 
+# Note popup shown when a focus period ends.
+cmd_note() {
+  local file="${POMODORO_PENDING:-}" entry note=""
+  [ -f "$file" ] || exit 0
+  entry="$(cat "$file")"
+  printf '\n  %s  \033[1mPomodoro done\033[0m  %s\n\n' "$ICON_WORK" \
+    "$(jq -r '"\(.start[11:16])–\(.end[11:16]) · \(.minutes)m"' <<<"$entry")"
+  jq -r '"  space   \(.space.label)" + (if .space.branch != "" then "  (\(.space.branch))" else "" end),
+         (.agents[] | "  agent   \(.title // .agent)")' <<<"$entry"
+  printf '\n  \033[2mWhat did you get done? Enter saves; empty keeps the agent titles.\033[0m\n\n  > '
+  read -r -e -t "$NOTE_TIMEOUT" note
+  flush_entry "$file" "$note"
+  [ "$NOTE_PROMPT" = required ] && cmd_start
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Log browser
+#
+# Rows are "<key>\t<text>". Keys are year:YYYY, month:YYYY-MM, day:YYYY-MM-DD
+# and entry:YYYY-MM-DD:<start epoch>; fzf shows only the text and hands the
+# key back to log-preview, log-drill and log-up.
+
+JQ_LIB='
+def dur: if . >= 60 then "\(. / 60 | floor)h \(. % 60)m" else "\(.)m" end;
+def summary:
+  if (.note // "") != "" then .note
+  else [.agents[]?.title | select(. != null and . != "")] | unique | join(" · ") end;
+def key_for($l):
+  if $l == "year" then .start[0:4] elif $l == "month" then .start[0:7] else .start[0:10] end;
+def weekday: .start_epoch | strflocaltime("%a");
+def space: .space.label + (if .space.branch != "" then " (\(.space.branch))" else "" end);
+def entry_line:
+  "\(.start[11:16])–\(.end[11:16])  \($icon) \(.minutes)m  \(space)  \(summary)"
+  + (if .outcome != "completed" then "  [\(.outcome)]" else "" end);
+def totals: "\($icon)×\(length)  \(map(.minutes) | add | dur)";
+def group_line($l):
+  "\(.[0] | key_for($l))" + (if $l == "day" then " \(.[0] | weekday)" else "" end)
+  + "  \(totals)"
+  + (if $l != "day" then "  \(map(.start[0:10]) | unique | length)d" else "" end)
+  + "  \(map(.space.label) | unique | join(", "))";
+def by_space:
+  group_by(.space.label) | sort_by(map(.minutes) | add) | reverse
+  | .[] | "  \(.[0].space.label)  \(totals)";
+'
+
+log_jq() {
+  jq -rs --arg icon "$ICON_WORK" "$@"
+}
+
+# log-rows <entry|day|month|year> [prefix]
+cmd_log_rows() {
+  local level="${1:-entry}" prefix="${2:-}"
+  [ -s "$LOG_FILE" ] || return 0
+  log_jq --arg level "$level" --arg prefix "$prefix" "$JQ_LIB"'
+    [.[] | select(.start | startswith($prefix))] | sort_by(.start_epoch) | reverse
+    | if $level == "entry" then
+        .[] | "entry:\(.start[0:10]):\(.start_epoch)\t\(.start[0:10]) \(weekday) \(entry_line)"
+      else
+        group_by(key_for($level)) | sort_by(.[0].start_epoch) | reverse
+        | .[] | "\($level):\(.[0] | key_for($level))\t\(group_line($level))"
+      end' "$LOG_FILE"
+}
+
+# log-preview <key>
+cmd_log_preview() {
+  local key="${1:-}" level rest
+  level="${key%%:*}"
+  rest="${key#*:}"
+  [ -s "$LOG_FILE" ] || return 0
+  case "$level" in
+    entry)
+      log_jq --argjson epoch "${rest##*:}" "$JQ_LIB"'
+        .[] | select(.start_epoch == $epoch)
+        | "\(.start[0:10]) \(weekday)  \(.start[11:16])–\(.end[11:16])  \(.minutes)m  \(.outcome)",
+          "",
+          "space   \(.space.label)",
+          "folder  \(.space.cwd)",
+          (if .space.branch != "" then "branch  \(.space.branch)" else empty end),
+          "",
+          (if (.note // "") != "" then "note    \(.note)", "" else empty end),
+          (if (.agents | length) > 0 then "agents" else empty end),
+          (.agents[] | "  \(.agent): \(.title // "")")' "$LOG_FILE"
+      ;;
+    day | month | year)
+      log_jq --arg level "$level" --arg prefix "$rest" "$JQ_LIB"'
+        [.[] | select(.start | startswith($prefix))] | sort_by(.start_epoch)
+        | (if $level == "day" then "\($prefix) \(.[0] | weekday)" else $prefix end) + "   \(totals)",
+          "",
+          (if $level == "day" then .[] | entry_line
+           else group_by(key_for(if $level == "year" then "month" else "day" end))
+             | .[] | group_line(if $level == "year" then "month" else "day" end) end),
+          "",
+          "by space",
+          by_space' "$LOG_FILE"
+      ;;
+  esac
+}
+
+# fzf actions to go one level down (log-drill) or up (log-up) from a row.
+cmd_log_drill() {
+  local key="${1:-}" self="$ROOT/bin/pomodoro" rest
+  rest="${key#*:}"
+  case "$key" in
+    year:*) echo "reload(bash '$self' log-rows month $rest)+change-prompt($rest › )+clear-query+first" ;;
+    month:*) echo "reload(bash '$self' log-rows day $rest)+change-prompt($rest › )+clear-query+first" ;;
+    day:*) echo "reload(bash '$self' log-rows entry $rest)+change-prompt($rest › )+clear-query+first" ;;
+  esac
+}
+
+cmd_log_up() {
+  local key="${1:-}" self="$ROOT/bin/pomodoro" day
+  case "$key" in
+    entry:*)
+      day="${key#entry:}"
+      day="${day%%:*}"
+      echo "reload(bash '$self' log-rows day ${day:0:7})+change-prompt(${day:0:7} › )+first"
+      ;;
+    day:*) echo "reload(bash '$self' log-rows month ${key:4:4})+change-prompt(${key:4:4} › )+first" ;;
+    month:*) echo "reload(bash '$self' log-rows year)+change-prompt(years › )+first" ;;
+  esac
+}
+
+cmd_log_browser() {
+  local self="$ROOT/bin/pomodoro"
+  if [ ! -s "$LOG_FILE" ]; then
+    printf '\n  No pomodoros logged yet.\n'
+    read -rsn1 -t 10 _
+    return 0
+  fi
+  if ! command -v fzf >/dev/null 2>&1; then
+    cmd_log all | less -R
+    return 0
+  fi
+  cmd_log_rows entry | SHELL=bash fzf \
+    --delimiter '\t' --with-nth 2 --no-sort --ansi \
+    --prompt 'all › ' \
+    --header 'enter: drill in · ⌫ on empty: up · ^y years · ^o months · ^d days · ^e entries · esc: close' \
+    --header-first \
+    --preview "bash '$self' log-preview {1}" \
+    --preview-window 'right,45%,wrap' \
+    --bind "enter:transform(bash '$self' log-drill {1})" \
+    --bind "backward-eof:transform(bash '$self' log-up {1})" \
+    --bind "ctrl-y:reload(bash '$self' log-rows year)+change-prompt(years › )+first" \
+    --bind "ctrl-o:reload(bash '$self' log-rows month)+change-prompt(months › )+first" \
+    --bind "ctrl-d:reload(bash '$self' log-rows day)+change-prompt(days › )+first" \
+    --bind "ctrl-e:reload(bash '$self' log-rows entry)+change-prompt(all › )+first" \
+    >/dev/null
+  return 0
+}
+
+# Print logged pomodoros: `log` for today, `log all`, or `log YYYY-MM-DD`.
+cmd_log() {
+  local day="${1:-$(date +%F)}"
+  [ -s "$LOG_FILE" ] || { echo "no pomodoros logged yet"; return 0; }
+  [ "$day" = all ] && day=""
+  cmd_log_rows entry "$day" | cut -f2 | sort
+}
+
 usage() {
   cat <<EOF
 usage: pomodoro <command>
@@ -553,6 +841,8 @@ usage: pomodoro <command>
   monitor   interactive monitor (runs in the popup pane)
   refresh   re-report the sidebar token
   scope-toggle  switch between one global timer and one per space
+  log [day|all] print logged pomodoros (default today)
+  log-browser   fuzzy-browse the log by year, month, day (needs fzf)
 EOF
 }
 
@@ -569,6 +859,13 @@ case "${1:-}" in
   open-monitor) cmd_open_monitor ;;
   refresh) cmd_refresh ;;
   scope-toggle) cmd_scope_toggle ;;
+  note) cmd_note ;;
+  log) cmd_log "${2:-}" ;;
+  log-browser) cmd_log_browser ;;
+  log-rows) cmd_log_rows "${2:-}" "${3:-}" ;;
+  log-preview) cmd_log_preview "${2:-}" ;;
+  log-drill) cmd_log_drill "${2:-}" ;;
+  log-up) cmd_log_up "${2:-}" ;;
   tick) cmd_tick ;;
   *) usage; exit 1 ;;
 esac

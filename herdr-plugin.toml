@@ -67,6 +67,29 @@ height = 14
 # Panes don't start in the plugin root, so resolve the script explicitly.
 command = ["sh", "-c", "exec bash \"$HERDR_PLUGIN_ROOT/bin/pomodoro\" monitor"]
 
+# Opened by the plugin when a focus period ends, to add a note to the log.
+[[panes]]
+id = "note"
+title = "Pomodoro done"
+placement = "popup"
+width = 76
+height = 16
+command = ["sh", "-c", "exec bash \"$HERDR_PLUGIN_ROOT/bin/pomodoro\" note"]
+
+[[actions]]
+id = "log"
+title = "Pomodoro: browse log"
+contexts = ["global"]
+command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint log --focus"]
+
+[[panes]]
+id = "log"
+title = "Pomodoro log"
+placement = "popup"
+width = "90%"
+height = "85%"
+command = ["sh", "-c", "exec bash \"$HERDR_PLUGIN_ROOT/bin/pomodoro\" log-browser"]
+
 # The token lives on the first workspace; follow it when the list changes.
 [[events]]
 on = "workspace.created"
