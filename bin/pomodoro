@@ -3,9 +3,11 @@
 #
 # The timer's truth is a wall-clock end timestamp in a state file. A small
 # ticker process runs only while the timer is running and reports the
-# countdown as the `$pomodoro` workspace metadata token on the first
-# workspace, so a `$pomodoro` row at the top of `ui.sidebar.spaces.rows`
-# renders above the spaces list.
+# countdown as the `$pomodoro` workspace metadata token.
+#
+# SCOPE=global keeps one timer and reports it on the first workspace only, so
+# a `$pomodoro` row at the top of `ui.sidebar.spaces.rows` renders above the
+# spaces list. SCOPE=space gives every workspace its own timer and token.
 #
 # Kept compatible with macOS's /bin/bash 3.2.
 
@@ -21,8 +23,6 @@ TOKEN="pomodoro"
 # herdr's plugin directories so every entrypoint shares one state file.
 CONFIG_DIR="${HERDR_PLUGIN_CONFIG_DIR:-$("$HERDR" plugin config-dir "$PLUGIN_ID" 2>/dev/null)}"
 STATE_DIR="${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/$PLUGIN_ID}"
-STATE_FILE="$STATE_DIR/state"
-LOCK_DIR="$STATE_DIR/lock"
 mkdir -p "$STATE_DIR"
 
 # ---------------------------------------------------------------------------
@@ -37,9 +37,28 @@ AUTO_START_WORK=0
 ICON_WORK="🍅"
 ICON_BREAK="☕"
 ICON_PAUSED="⏸"
-SHOW_IDLE=1
-NOTIFY=herdr # herdr | system | both | off
+SCOPE=global # global | space
+SHOW_IDLE=""  # 1 or 0; defaults to 1 for global, 0 for space
+NOTIFY=herdr  # herdr | system | both | off
 [ -f "$CONFIG_DIR/config" ] && . "$CONFIG_DIR/config"
+if [ -z "$SHOW_IDLE" ]; then
+  if [ "$SCOPE" = space ]; then SHOW_IDLE=0; else SHOW_IDLE=1; fi
+fi
+
+# Pick the timer to act on. In space scope that's the given workspace, else
+# the one herdr says is active (plugin commands and tab bar commands use
+# different variable names), else the focused one.
+select_scope() {
+  if [ "$SCOPE" = space ]; then
+    WS="${1:-${POMODORO_WORKSPACE:-${HERDR_ACTIVE_WORKSPACE_ID:-${HERDR_WORKSPACE_ID:-}}}}"
+    [ -n "$WS" ] || WS="$(focused_workspace)"
+    STATE_FILE="$STATE_DIR/state.$WS"
+  else
+    WS=""
+    STATE_FILE="$STATE_DIR/state"
+  fi
+  LOCK_DIR="$STATE_FILE.lock"
+}
 
 # ---------------------------------------------------------------------------
 # State
@@ -50,13 +69,13 @@ load_state() {
   END=0         # epoch seconds when a running phase ends
   REMAINING=0   # seconds left in a paused phase
   DONE=0        # completed work sessions since reset
-  TARGET=""     # workspace id carrying the token
+  TARGET="$WS"  # workspace id carrying the token
   TICKER=""     # pid of the ticker process
   [ -f "$STATE_FILE" ] && . "$STATE_FILE"
 }
 
 save_state() {
-  local tmp="$STATE_FILE.$$"
+  local tmp="$STATE_FILE.tmp.$$"
   cat >"$tmp" <<EOF
 STATUS=$STATUS
 PHASE=$PHASE
@@ -160,9 +179,24 @@ status_line() {
 # ---------------------------------------------------------------------------
 # herdr integration
 
-first_workspace() {
+workspace_ids() {
   "$HERDR" workspace list 2>/dev/null |
+    grep -o '"workspace_id":"[^"]*"' | cut -d'"' -f4
+}
+
+first_workspace() {
+  workspace_ids | head -n 1
+}
+
+focused_workspace() {
+  "$HERDR" workspace list 2>/dev/null |
+    grep -o '{[^{}]*"focused":true[^{}]*}' |
     grep -o '"workspace_id":"[^"]*"' | head -n 1 | cut -d'"' -f4
+}
+
+workspace_label() {
+  "$HERDR" workspace get "$1" 2>/dev/null |
+    grep -o '"label":"[^"]*"' | head -n 1 | cut -d'"' -f4
 }
 
 clear_token() {
@@ -174,6 +208,10 @@ clear_token() {
 # Point TARGET at the first workspace, moving the token if it changed.
 retarget() {
   local first
+  if [ "$SCOPE" = space ]; then
+    TARGET="$WS"
+    return 0
+  fi
   first="$(first_workspace)"
   if [ -n "$first" ] && [ "$first" != "$TARGET" ]; then
     clear_token "$TARGET"
@@ -226,7 +264,7 @@ stop_ticker() {
 
 start_ticker() {
   stop_ticker
-  nohup bash "$ROOT/bin/pomodoro" tick >/dev/null 2>&1 &
+  nohup bash "$ROOT/bin/pomodoro" tick "$WS" >/dev/null 2>&1 &
   TICKER=$!
   disown "$TICKER" 2>/dev/null
 }
@@ -330,17 +368,84 @@ cmd_skip() {
   report
 }
 
-# Re-sync after herdr starts or the workspace list changes.
-cmd_refresh() {
+# Revive the ticker if needed and re-report one timer's token.
+refresh_one() {
   lock
   load_state
   retarget
   if [ "$STATUS" = running ] && ! ticker_alive; then
     start_ticker
   fi
-  save_state
+  [ -f "$STATE_FILE" ] && save_state
   unlock
   report
+}
+
+# Re-sync after herdr starts, the workspace list changes, or SCOPE changes.
+cmd_refresh() {
+  local ids id file
+  ids="$(workspace_ids)"
+  # Start from a clean slate so switching SCOPE leaves no stale tokens.
+  for id in $ids; do clear_token "$id"; done
+
+  # Drop timers for workspaces that are gone. Pause the other scope's timers
+  # so toggling SCOPE back picks them up where they were.
+  for file in "$STATE_DIR"/state "$STATE_DIR"/state.*; do
+    [ -f "$file" ] || continue
+    case "$file" in *.tmp.* | *.lock) continue ;; esac
+    id="${file##*/state}"
+    id="${id#.}"
+    STATE_FILE="$file"
+    LOCK_DIR="$file.lock"
+    if [ -n "$id" ] && ! printf '%s\n' "$ids" | grep -qx "$id"; then
+      lock
+      load_state
+      stop_ticker
+      rm -f "$file"
+      unlock
+    elif { [ "$SCOPE" = space ] && [ -z "$id" ]; } ||
+      { [ "$SCOPE" != space ] && [ -n "$id" ]; }; then
+      lock
+      load_state
+      if [ "$STATUS" = running ]; then
+        REMAINING="$(remaining)"
+        STATUS=paused
+      fi
+      stop_ticker
+      save_state
+      unlock
+    fi
+  done
+
+  if [ "$SCOPE" = space ]; then
+    for id in $ids; do
+      select_scope "$id"
+      refresh_one
+    done
+  else
+    select_scope
+    refresh_one
+  fi
+}
+
+# Flip SCOPE between global and space in the config file, then re-sync.
+cmd_scope_toggle() {
+  local next=space config="$CONFIG_DIR/config"
+  [ "$SCOPE" = space ] && next=global
+  mkdir -p "$CONFIG_DIR"
+  touch "$config"
+  if grep -q '^SCOPE=' "$config"; then
+    sed -i.bak "s/^SCOPE=.*/SCOPE=$next/" "$config" && rm -f "$config.bak"
+  else
+    echo "SCOPE=$next" >>"$config"
+  fi
+  # Re-run so SCOPE and its SHOW_IDLE default are re-read from the config.
+  bash "$ROOT/bin/pomodoro" refresh
+  if [ "$next" = space ]; then
+    notify "$ICON_WORK Pomodoro" "One timer per space."
+  else
+    notify "$ICON_WORK Pomodoro" "One global timer."
+  fi
 }
 
 cmd_tick() {
@@ -374,7 +479,9 @@ cmd_status() {
 }
 
 cmd_open_monitor() {
-  "$HERDR" plugin pane open --plugin "$PLUGIN_ID" --entrypoint monitor --focus >/dev/null
+  # Pin the popup to the space it was opened from.
+  "$HERDR" plugin pane open --plugin "$PLUGIN_ID" --entrypoint monitor --focus \
+    --env "POMODORO_WORKSPACE=$WS" >/dev/null
 }
 
 progress_bar() {
@@ -405,7 +512,8 @@ draw_monitor() {
     paused) state="paused" ;;
   esac
   printf '\033[H\033[2J'
-  printf '\n  %s  %s  (%s)\n\n' "$(phase_icon)" "$(phase_name)" "$state"
+  printf '\n  %s  %s  (%s)\n' "$(phase_icon)" "$(phase_name)" "$state"
+  if [ -n "$WS" ]; then printf '  \033[2mspace: %s\033[0m\n\n' "$LABEL"; else printf '\n'; fi
   printf '  \033[1m%s\033[0m\n\n' "$(clock "$(remaining)")"
   printf '  %s\n\n' "$(progress_bar 30)"
   printf '  %s  %d done\n\n' "$(cycle_marks)" "$DONE"
@@ -416,6 +524,8 @@ cmd_monitor() {
   printf '\033[?25l'
   trap 'printf "\033[?25h"' EXIT
   local key
+  LABEL=""
+  [ -n "$WS" ] && LABEL="$(workspace_label "$WS")"
   while :; do
     load_state
     draw_monitor
@@ -442,8 +552,11 @@ usage: pomodoro <command>
   status    print the current status line
   monitor   interactive monitor (runs in the popup pane)
   refresh   re-report the sidebar token
+  scope-toggle  switch between one global timer and one per space
 EOF
 }
+
+if [ "${1:-}" = tick ]; then select_scope "${2:-}"; else select_scope; fi
 
 case "${1:-}" in
   start) cmd_start ;;
@@ -455,6 +568,7 @@ case "${1:-}" in
   monitor) cmd_monitor ;;
   open-monitor) cmd_open_monitor ;;
   refresh) cmd_refresh ;;
+  scope-toggle) cmd_scope_toggle ;;
   tick) cmd_tick ;;
   *) usage; exit 1 ;;
 esac

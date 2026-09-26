@@ -45,6 +45,19 @@ title = "Pomodoro: monitor"
 contexts = ["global"]
 command = ["bash", "bin/pomodoro", "open-monitor"]
 
+[[actions]]
+id = "scope-toggle"
+title = "Pomodoro: toggle global / per-space timer"
+contexts = ["global"]
+command = ["bash", "bin/pomodoro", "scope-toggle"]
+
+# Run after changing the config (e.g. SCOPE) to re-sync every token.
+[[actions]]
+id = "refresh"
+title = "Pomodoro: reload config"
+contexts = ["global"]
+command = ["bash", "bin/pomodoro", "refresh"]
+
 [[panes]]
 id = "monitor"
 title = "Pomodoro"
